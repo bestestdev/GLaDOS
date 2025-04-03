@@ -60,6 +60,8 @@ class GladosConfig(BaseModel):
     conversation_timeout: float = 10.0
     enable_vision: bool = False
     vision_scene_announcement_interval: float = 60.0
+    person_greeting_enabled: bool = True
+    special_objects_responses: bool = True
 
     @classmethod
     def from_yaml(cls, path: str | Path, key_to_config: tuple[str, ...] = ("Glados",)) -> "GladosConfig":
@@ -140,6 +142,8 @@ class Glados:
         announcement: str | None = None,
         enable_vision: bool = False,
         vision_scene_announcement_interval: float = 60.0,
+        person_greeting_enabled: bool = True,
+        special_objects_responses: bool = True,
     ) -> None:
         """
         Initialize the Glados voice assistant with configuration parameters.
@@ -208,7 +212,10 @@ class Glados:
             self.vision_integration = GladosVisionIntegration(
                 self, 
                 vision=vision_processor,
-                scene_description_interval=vision_scene_announcement_interval
+                auto_describe_scene=vision_scene_announcement_interval > 0.0,
+                scene_description_interval=vision_scene_announcement_interval,
+                person_greeting_enabled=person_greeting_enabled,
+                special_objects_responses=special_objects_responses,
             )
             if self.vision_integration.start():
                 logger.success("Vision system initialized and started")
@@ -316,6 +323,8 @@ class Glados:
             personality_preprompt=tuple(config.to_chat_messages()),
             enable_vision=config.enable_vision,
             vision_scene_announcement_interval=config.vision_scene_announcement_interval,
+            person_greeting_enabled=config.person_greeting_enabled,
+            special_objects_responses=config.special_objects_responses,
         )
         
         # Set the conversation timeout from config
@@ -687,20 +696,64 @@ class Glados:
                 detected_text = self.llm_queue.get(timeout=0.1)
                 self.messages.append({"role": "user", "content": detected_text})
 
+                # Check if this is a vision-related query
+                is_vision_query = False
+                vision_query_patterns = [
+                    r"what (?:can|do) you see",
+                    r"(?:can|do) you see",
+                    r"what (?:are|is) (?:in front of|around) you",
+                    r"what's (?:in front of|around) you",
+                    r"describe what you see",
+                    r"tell me what you see",
+                    r"what's (?:in|on) the (?:room|scene)",
+                ]
+                
+                for pattern in vision_query_patterns:
+                    if re.search(pattern, detected_text.lower()):
+                        is_vision_query = True
+                        logger.debug(f"Detected vision-related query: '{detected_text}'")
+                        break
+
                 # Add vision context if available
+                logger.debug(f"Vision enabled: {self.enable_vision}, Vision integration available: {self.vision_integration is not None}")
                 if self.enable_vision and self.vision_integration:
+                    logger.debug(f"Generating visual context for prompt with text: '{detected_text}'")
                     vision_context = self.vision_integration.generate_visual_context()
+                    logger.debug(f"Generated vision context: '{vision_context}'")
                     if vision_context:
                         # Add visual context as a system message
                         self.messages.append({"role": "system", "content": f"Visual context: {vision_context}"})
-                        logger.info(f"Added visual context: {vision_context}")
+                        logger.success(f"Added visual context to LLM prompt: {vision_context}")
+                        
+                        # For vision-specific queries, add an extra instruction to ensure 
+                        # the response directly addresses what GLaDOS can see
+                        if is_vision_query:
+                            self.messages.append({
+                                "role": "system", 
+                                "content": "When answering this question about what you can see, make sure to directly and accurately describe the visual context provided. Do not make up objects that aren't mentioned in the visual context."
+                            })
+                    else:
+                        if is_vision_query:
+                            # For vision queries with no objects detected, provide a specific message
+                            self.messages.append({
+                                "role": "system", 
+                                "content": "You should respond that you don't see anything notable right now."
+                            })
+                            logger.warning("No vision context available for vision query, adding fallback instruction")
+                        else:
+                            logger.warning("Vision context generation returned empty result")
+                else:
+                    logger.warning("Vision context not added - either vision is disabled or integration unavailable")
 
                 data = {
                     "model": self.model,
                     "stream": True,
                     "messages": self.messages,
                 }
-                logger.debug(f"starting request on {self.messages=}")
+                # Log the full message history being sent to see if vision context is included
+                logger.debug(f"Message history being sent to LLM:")
+                for i, msg in enumerate(self.messages):
+                    logger.debug(f"  Message {i}: role={msg['role']}, content={msg['content'][:50]}...")
                 logger.debug("Performing request to LLM server...")
 
                 # Perform the request and process the stream

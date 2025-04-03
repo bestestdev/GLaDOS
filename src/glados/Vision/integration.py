@@ -212,7 +212,16 @@ class GladosVisionIntegration:
         Returns:
             str: Visual context description
         """
+        # Check if vision processor is running
+        if not self.vision.is_running:
+            logger.warning("INTEGRATION: Vision processor is not running when requesting visual context")
+            return "Vision system is currently offline."
+        
+        # Debug the vision processor state
+        logger.debug(f"INTEGRATION: Vision processor running: {self.vision.is_running}")
+        
         # Get the scene analysis
+        logger.debug("INTEGRATION: Calling analyze_scene to get current objects")
         class_counts = self.vision.analyze_scene()
         logger.debug(f"INTEGRATION: Scene analysis result: {class_counts}")
         
@@ -222,10 +231,12 @@ class GladosVisionIntegration:
         if center_obj:
             center_desc = f"The {center_obj.label} is directly in front of me. "
             logger.debug(f"INTEGRATION: Center object detected: {center_obj.label}")
+        else:
+            logger.debug("INTEGRATION: No object detected in center of frame")
         
         # Format the context
         if not class_counts:
-            logger.debug("INTEGRATION: No objects detected in visual context")
+            logger.warning("INTEGRATION: No objects detected in visual context")
             return "I don't see anything notable in my visual field right now."
         
         # Create a list of object descriptions

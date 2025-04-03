@@ -351,12 +351,13 @@ class VisionProcessor:
             return self.current_frame.copy()
     
     def get_current_detections(self) -> List[Detection]:
-        """Get the current detections.
+        """Get a copy of the current detections.
         
         Returns:
-            List[Detection]: List of current detections
+            List[Detection]: Copy of the current detections
         """
         with self.frame_lock:
+            logger.debug(f"Vision processor returning {len(self.current_detections)} current detections")
             return self.current_detections.copy()
     
     def get_object_in_center(
@@ -431,13 +432,23 @@ class VisionProcessor:
         Returns:
             Dict[str, int]: Dictionary of class names to counts
         """
+        logger.debug("Vision processor analyzing scene...")
+        
+        # Check if vision system is running
+        if not self.is_running:
+            logger.warning("Vision processor not running during scene analysis")
+            return {}
+        
         detections = self.get_current_detections()
+        logger.debug(f"Found {len(detections)} detections for scene analysis")
         
         # Count objects by class
         class_counts: Dict[str, int] = {}
         for det in detections:
             class_counts[det.label] = class_counts.get(det.label, 0) + 1
-            
+            logger.debug(f"Added detection: {det.label} (confidence: {det.confidence:.2f})")
+        
+        logger.debug(f"Scene analysis complete, found {len(class_counts)} unique object types")
         return class_counts
     
     def get_scene_description(self) -> str:
