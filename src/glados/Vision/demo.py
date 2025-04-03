@@ -22,6 +22,9 @@ def main():
         "--camera", type=int, default=0, help="Camera ID to use (default: 0)"
     )
     parser.add_argument(
+        "--device", type=str, default=None, help="Direct camera device path (e.g., /dev/video0 or /dev/media0)"
+    )
+    parser.add_argument(
         "--model", type=str, default=None, help="Path to custom PyTorch model (.pt)"
     )
     parser.add_argument(
@@ -36,15 +39,40 @@ def main():
     parser.add_argument(
         "--save-frames", type=str, default=None, help="Directory to save frames (if provided)"
     )
+    parser.add_argument(
+        "--enable-display", action="store_true", help="Enable GUI display (not recommended for headless systems)"
+    )
+    parser.add_argument(
+        "--rpi-camera", action="store_true", help="Force use of Picamera2 for Raspberry Pi camera"
+    )
     args = parser.parse_args()
 
     # Set up logging
     logger.remove()
     logger.add(sys.stderr, level="INFO")
 
-    # Initialize camera
-    logger.info(f"Initializing camera with ID {args.camera}")
-    camera = Camera(camera_id=args.camera)
+    # Check for direct device access
+    if args.device:
+        # Try to determine camera ID from device name if possible
+        camera_id = args.camera
+        if args.device.startswith("/dev/video"):
+            try:
+                camera_id = int(args.device[len("/dev/video"):])
+                logger.info(f"Using camera ID {camera_id} from device path {args.device}")
+            except ValueError:
+                logger.warning(f"Could not extract camera ID from {args.device}, using default {args.camera}")
+        
+        # Make sure the device exists
+        if not os.path.exists(args.device):
+            logger.error(f"Device {args.device} does not exist")
+            return
+            
+        logger.info(f"Initializing camera with device {args.device} (ID: {camera_id})")
+        camera = Camera(camera_id=camera_id, use_picamera=args.rpi_camera)
+    else:
+        # Standard camera initialization
+        logger.info(f"Initializing camera with ID {args.camera}")
+        camera = Camera(camera_id=args.camera, use_picamera=args.rpi_camera)
 
     # Initialize detector with custom model if provided
     detector_args = {}
@@ -58,12 +86,12 @@ def main():
     logger.info("Initializing object detector")
     detector = ObjectDetector(**detector_args)
 
-    # Initialize vision processor
+    # Initialize vision processor - disable display by default (headless mode)
     logger.info("Starting vision processor")
     processor = VisionProcessor(
         camera=camera,
         detector=detector,
-        enable_display=True,
+        enable_display=args.enable_display,
         enable_tracking=args.tracking
     )
 
@@ -88,7 +116,10 @@ def main():
         logger.error("Failed to start vision processor")
         return
 
-    logger.info("Press ESC in the display window to exit")
+    if args.enable_display:
+        logger.info("Press ESC in the display window to exit")
+    else:
+        logger.info("Running in headless mode - press Ctrl+C to exit")
     
     try:
         # Main loop
@@ -97,24 +128,22 @@ def main():
         frame_count = 0
         
         while processor.is_running:
-            # Print scene description every 5 seconds
-            current_time = time.time()
-            if current_time - last_description_time >= 5.0:
+            # Get current frame and describe the scene
+            frame = processor.get_current_frame()
+            if frame is not None:
+                # Print scene description for every frame
                 description = processor.get_scene_description()
                 logger.info(f"Scene: {description}")
-                last_description_time = current_time
+                frame_count += 1
                 
-            # Save frames if requested (every 2 seconds)
-            if args.save_frames and current_time - last_save_time >= 2.0:
-                frame = processor.get_current_frame()
-                if frame is not None:
+                # Save frames if requested
+                if args.save_frames and time.time() - last_save_time >= 2.0:
                     frame_path = os.path.join(args.save_frames, f"frame_{frame_count:04d}.jpg")
                     cv2.imwrite(frame_path, frame)
-                    frame_count += 1
-                    last_save_time = current_time
-                    
-            # Sleep to reduce CPU usage
-            time.sleep(0.1)
+                    last_save_time = time.time()
+            
+            # Sleep to reduce CPU usage but remain responsive
+            time.sleep(0.05)
             
     except KeyboardInterrupt:
         logger.info("Interrupted by user")

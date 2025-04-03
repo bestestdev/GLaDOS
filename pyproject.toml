@@ -14,7 +14,7 @@ dependencies = [
     "numba>=0.61.0",
     "soundfile>=0.13.0",
     "pydantic>=2.10.6",
-    "opencv-python>=4.8.0",
+    "opencv-python-headless>=4.8.0",
 ]
 
 [project.optional-dependencies]
@@ -30,11 +30,12 @@ dev = [
 ]
 api = ["litestar[standard,structlog]>=2.15.1"]
 vision = [
-    "opencv-python>=4.8.0",
+    "opencv-python-headless>=4.8.0",
     "onnxruntime>=1.16.0",
     "tqdm>=4.66.0",
     "ultralytics>=8.0.0",
     "torch>=2.0.0",
+    "picamera2>=0.3.12",
 ]
 
 [project.scripts]
