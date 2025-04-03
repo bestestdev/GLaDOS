@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 from Levenshtein import distance
 from loguru import logger
@@ -21,6 +21,7 @@ import yaml
 
 from .ASR import VAD, AudioTranscriber
 from .TTS import tts_glados, tts_kokoro
+from .Vision import GladosVisionIntegration, VisionProcessor
 from .utils import spoken_text_converter as stc
 from .utils.resources import resource_path
 
@@ -57,6 +58,8 @@ class GladosConfig(BaseModel):
     announcement: str | None = None
     personality_preprompt: list[PersonalityPrompt]
     conversation_timeout: float = 10.0
+    enable_vision: bool = False
+    vision_scene_announcement_interval: float = 60.0
 
     @classmethod
     def from_yaml(cls, path: str | Path, key_to_config: tuple[str, ...] = ("Glados",)) -> "GladosConfig":
@@ -135,6 +138,8 @@ class Glados:
         wake_word: str | None = None,
         personality_preprompt: tuple[dict[str, str], ...] = DEFAULT_PERSONALITY_PREPROMPT,
         announcement: str | None = None,
+        enable_vision: bool = False,
+        vision_scene_announcement_interval: float = 60.0,
     ) -> None:
         """
         Initialize the Glados voice assistant with configuration parameters.
@@ -194,6 +199,23 @@ class Glados:
         self.currently_speaking = threading.Event()
         self.shutdown_event = threading.Event()
         self.last_response_time = 0.0  # Timestamp when the assistant last stopped speaking
+
+        # Initialize vision system if enabled
+        self.vision_integration: Optional[GladosVisionIntegration] = None
+        self.enable_vision = enable_vision
+        if enable_vision:
+            vision_processor = VisionProcessor()
+            self.vision_integration = GladosVisionIntegration(
+                self, 
+                vision=vision_processor,
+                scene_description_interval=vision_scene_announcement_interval
+            )
+            if self.vision_integration.start():
+                logger.success("Vision system initialized and started")
+            else:
+                logger.error("Failed to start vision system")
+                self.vision_integration = None
+                self.enable_vision = False
 
         llm_thread = threading.Thread(target=self.process_llm)
         llm_thread.start()
@@ -292,6 +314,8 @@ class Glados:
             wake_word=config.wake_word,
             announcement=config.announcement,
             personality_preprompt=tuple(config.to_chat_messages()),
+            enable_vision=config.enable_vision,
+            vision_scene_announcement_interval=config.vision_scene_announcement_interval,
         )
         
         # Set the conversation timeout from config
@@ -340,9 +364,15 @@ class Glados:
         # Loop forever, but is 'paused' when new samples are not available
         try:
             while True:
+                # Update vision system if enabled
+                if self.enable_vision and self.vision_integration:
+                    self.vision_integration.update()
+                
                 sample, vad_confidence = self._sample_queue.get()
                 self._handle_audio_sample(sample, vad_confidence)
         except KeyboardInterrupt:
+            if self.enable_vision and self.vision_integration:
+                self.vision_integration.stop()
             self.shutdown_event.set()
             self.input_stream.stop()
 
@@ -656,6 +686,14 @@ class Glados:
             try:
                 detected_text = self.llm_queue.get(timeout=0.1)
                 self.messages.append({"role": "user", "content": detected_text})
+
+                # Add vision context if available
+                if self.enable_vision and self.vision_integration:
+                    vision_context = self.vision_integration.generate_visual_context()
+                    if vision_context:
+                        # Add visual context as a system message
+                        self.messages.append({"role": "system", "content": f"Visual context: {vision_context}"})
+                        logger.info(f"Added visual context: {vision_context}")
 
                 data = {
                     "model": self.model,

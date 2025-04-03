@@ -231,6 +231,7 @@ class Camera:
         # Set up frame capture parameters
         frame_interval = 1.0 / min(self.fps, 2.5)  # Max 2.5 fps for still captures, adjust as needed
         last_capture_time = 0
+        last_log_time = 0  # Track when we last logged a successful frame
         frame_count = 0
         consecutive_failures = 0
         max_consecutive_failures = 5
@@ -296,8 +297,10 @@ class Camera:
                                 last_capture_time = current_time
                                 consecutive_failures = 0  # Reset failure counter
                                 
-                                # Log success for every frame
-                                logger.success(f"Successfully captured frame {frame_count}")
+                                # Log success only once every 60 seconds
+                                if current_time - last_log_time >= 60.0:
+                                    logger.success(f"Successfully captured frame {frame_count}")
+                                    last_log_time = current_time
                             else:
                                 logger.warning(f"Failed to read captured frame from {output_path}")
                                 consecutive_failures += 1

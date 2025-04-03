@@ -1,13 +1,19 @@
 """Integration between GLaDOS engine and Vision module."""
 
 import time
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Set, Tuple, TYPE_CHECKING, Any
 
 from loguru import logger
 
-from ..engine import Glados
+# Remove direct import of Glados to break circular dependency
+# from ..engine import Glados
+
 from .detector import Detection
 from .processor import TrackedObject, VisionProcessor
+
+# Use TYPE_CHECKING to allow type hints without runtime imports
+if TYPE_CHECKING:
+    from ..engine import Glados
 
 
 class GladosVisionIntegration:
@@ -19,15 +25,12 @@ class GladosVisionIntegration:
     3. Managing GLaDOS's responses to visual stimuli
     """
     
-    # Threshold for high-confidence detections that should trigger responses
-    HIGH_CONFIDENCE = 0.8
-    
     # Cooldown time (seconds) between responses to the same object class
     RESPONSE_COOLDOWN = 20.0
     
     def __init__(
         self, 
-        glados: Glados, 
+        glados: "Glados", 
         vision: Optional[VisionProcessor] = None,
         auto_describe_scene: bool = True,
         scene_description_interval: float = 60.0,
@@ -62,19 +65,11 @@ class GladosVisionIntegration:
         self.vision.add_new_detection_callback(self._on_new_detection)
         self.vision.add_object_lost_callback(self._on_object_lost)
         
-        # Special responses for object classes
-        self.special_object_responses = {
-            "person": "Hello, human. I see you.",
-            "cat": "Oh, a cat. I've always wanted a pet.",
-            "dog": "Is that a dog? How delightful.",
-            "cake": "The cake is a lie. Or is it?",
-            "computer": "I see you have a computer. Perhaps we can be friends.",
-            "book": "I see you have a book. I've read every book ever written, you know.",
-            "phone": "I see you have a communication device. No need to call for help.",
-            "food": "Food? I don't eat, but I can appreciate the aesthetics.",
-            "bottle": "I hope that's not neurotoxin in that bottle.",
-            "cup": "Would you like some cake with your beverage?",
-        }
+        # Special objects to respond to - these are just categories we'll generate responses for
+        self.special_object_categories = [
+            "person", "cat", "dog", "cake", "computer", "book", 
+            "phone", "food", "bottle", "cup"
+        ]
         
     def start(self) -> bool:
         """Start the vision integration.
@@ -103,9 +98,11 @@ class GladosVisionIntegration:
     
     def _describe_scene(self) -> None:
         """Generate and speak a description of the current scene."""
-        description = self.vision.get_scene_description()
-        if description:
-            self.glados.tts_queue.put(description)
+        scene_description = self.vision.get_scene_description()
+        if scene_description:
+            # Instead of directly speaking the scene description,
+            # we'll ask the LLM to comment on what it sees
+            self._send_llm_prompt(f"Announce what you currently see: {scene_description}")
     
     def _on_new_detection(self, detection: Detection) -> None:
         """Callback for when a new object is detected.
@@ -116,23 +113,30 @@ class GladosVisionIntegration:
         # Track seen classes
         self.detected_classes.add(detection.label)
         
-        current_time = time.time()
+        # Log the detection
+        logger.debug(f"INTEGRATION: Detection callback for {detection.label}")
         
-        # Only respond if the detection is confident enough and cooldown has passed
-        if detection.confidence >= self.HIGH_CONFIDENCE:
-            last_response_time = self.class_last_response_time.get(detection.label, 0)
-            if current_time - last_response_time >= self.RESPONSE_COOLDOWN:
-                # Handle person detection
-                if detection.label == "person" and self.person_greeting_enabled:
-                    self.glados.tts_queue.put(self.special_object_responses["person"])
-                    self.class_last_response_time[detection.label] = current_time
-                
-                # Handle special objects
-                elif (self.special_objects_responses and 
-                        detection.label in self.special_object_responses and
-                        detection.label != "person"):  # Already handled person above
-                    self.glados.tts_queue.put(self.special_object_responses[detection.label])
-                    self.class_last_response_time[detection.label] = current_time
+        current_time = time.time()
+        last_response_time = self.class_last_response_time.get(detection.label, 0)
+        
+        if current_time - last_response_time >= self.RESPONSE_COOLDOWN:
+            logger.info(f"INTEGRATION: Response cooldown passed for {detection.label}, proceeding with response")
+            
+            # Handle person detection
+            if detection.label == "person" and self.person_greeting_enabled:
+                logger.success(f"INTEGRATION: Person detected! Sending greeting prompt")
+                self._send_llm_prompt(f"You see a person. Make a brief greeting.")
+                self.class_last_response_time[detection.label] = current_time
+            
+            # Handle special objects
+            elif (self.special_objects_responses and 
+                  detection.label in self.special_object_categories and
+                  detection.label != "person"):  # Already handled person above
+                logger.success(f"INTEGRATION: Special object {detection.label} detected! Sending comment prompt")
+                self._send_llm_prompt(f"You just noticed a {detection.label}. Make a brief comment about it.")
+                self.class_last_response_time[detection.label] = current_time
+        else:
+            logger.debug(f"INTEGRATION: Response cooldown not passed for {detection.label} - {current_time - last_response_time:.1f}s elapsed of {self.RESPONSE_COOLDOWN}s")
     
     def _on_object_lost(self, tracked_obj: TrackedObject) -> None:
         """Callback for when a tracked object is lost.
@@ -143,7 +147,29 @@ class GladosVisionIntegration:
         # Only respond to objects that were visible for a while (not false positives)
         if (tracked_obj.frames_visible > 10 and 
                 tracked_obj.detection.label in self.focus_objects):
-            self.glados.tts_queue.put(f"I no longer see the {tracked_obj.detection.label}.")
+            self._send_llm_prompt(f"You no longer see the {tracked_obj.detection.label} that was there before. Make a brief comment about this.")
+    
+    def _send_llm_prompt(self, prompt: str) -> None:
+        """Send a prompt to the LLM to generate a response.
+        
+        Instead of using predefined responses, this method asks the LLM to generate
+        a contextual response based on the visual event.
+        
+        Args:
+            prompt: Instruction for the LLM about what to respond to
+        """
+        # Add our prompt as a system message
+        self.glados.messages.append({"role": "system", "content": prompt})
+        
+        # Use the existing processing flag to prevent interruptions during processing
+        self.glados.processing = True
+        
+        # Use the existing LLM/TTS pipeline by adding an "empty" user message
+        # This will trigger the standard LLM processing with our system prompt included
+        self.glados.llm_queue.put("Respond to the visual context.")
+        
+        # Log what we're doing
+        logger.info(f"Sent visual event prompt to LLM: {prompt}")
     
     def set_focus_objects(self, object_classes: List[str]) -> None:
         """Set the object classes to focus on for lost-object notifications.
@@ -169,14 +195,14 @@ class GladosVisionIntegration:
             
         return result
     
-    def add_special_object_response(self, object_class: str, response: str) -> None:
-        """Add or update a special response for a specific object class.
+    def add_special_object_category(self, object_class: str) -> None:
+        """Add a special object category to respond to.
         
         Args:
             object_class: Class name to respond to
-            response: Text to speak when object is detected
         """
-        self.special_object_responses[object_class] = response
+        if object_class not in self.special_object_categories:
+            self.special_object_categories.append(object_class)
     
     def generate_visual_context(self) -> str:
         """Generate a visual context string that can be added to GLaDOS's context.
@@ -188,15 +214,18 @@ class GladosVisionIntegration:
         """
         # Get the scene analysis
         class_counts = self.vision.analyze_scene()
+        logger.debug(f"INTEGRATION: Scene analysis result: {class_counts}")
         
         # Get center object if any
         center_obj = self.vision.get_object_in_center()
         center_desc = ""
         if center_obj:
             center_desc = f"The {center_obj.label} is directly in front of me. "
+            logger.debug(f"INTEGRATION: Center object detected: {center_obj.label}")
         
         # Format the context
         if not class_counts:
+            logger.debug("INTEGRATION: No objects detected in visual context")
             return "I don't see anything notable in my visual field right now."
         
         # Create a list of object descriptions
@@ -215,7 +244,9 @@ class GladosVisionIntegration:
         else:
             objects_desc = f"I can see {', '.join(obj_descs[:-1])}, and {obj_descs[-1]}"
         
-        return f"{center_desc}{objects_desc}."
+        final_context = f"{center_desc}{objects_desc}."
+        logger.debug(f"INTEGRATION: Generated visual context: {final_context}")
+        return final_context
     
     @property
     def is_running(self) -> bool:
