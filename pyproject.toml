@@ -15,6 +15,12 @@ dependencies = [
     "soundfile>=0.13.0",
     "pydantic>=2.10.6",
     "opencv-python-headless>=4.8.0",
+    "wyoming>=1.6.0",
+    "onnxruntime>=1.16.0",
+    "tqdm>=4.66.0",
+    "ultralytics>=8.0.0",
+    "torch>=2.0.0",
+    "picamera2>=0.3.12"
 ]
 
 [project.optional-dependencies]
@@ -29,14 +35,6 @@ dev = [
     "types-PyYAML",
 ]
 api = ["litestar[standard,structlog]>=2.15.1"]
-vision = [
-    "opencv-python-headless>=4.8.0",
-    "onnxruntime>=1.16.0",
-    "tqdm>=4.66.0",
-    "ultralytics>=8.0.0",
-    "torch>=2.0.0",
-    "picamera2>=0.3.12",
-]
 
 [project.scripts]
 glados = "glados.cli:main"

@@ -26,7 +26,7 @@ from .utils import spoken_text_converter as stc
 from .utils.resources import resource_path
 
 logger.remove(0)
-logger.add(sys.stderr, level="SUCCESS")
+logger.add(sys.stderr, level="DEBUG")
 
 
 class PersonalityPrompt(BaseModel):
@@ -62,6 +62,7 @@ class GladosConfig(BaseModel):
     vision_scene_announcement_interval: float = 60.0
     person_greeting_enabled: bool = True
     special_objects_responses: bool = True
+    wyoming_whisper_url: str | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path, key_to_config: tuple[str, ...] = ("Glados",)) -> "GladosConfig":
@@ -300,14 +301,44 @@ class Glados:
         Returns:
             Glados: A new Glados instance configured with the provided settings
         """
-        asr_model = AudioTranscriber()
         vad_model = VAD()
+
+        # Initialize ASR model based on config
+        if config.wyoming_whisper_url:
+            try:
+                # Use Wyoming Whisper server if configured
+                from .Whisper import WyomingTranscriber
+                
+                logger.info(f"Attempting to use Wyoming Whisper at {config.wyoming_whisper_url}")
+                
+                # Create the Wyoming transcriber
+                wyoming_asr = WyomingTranscriber(
+                    uri=f"tcp://{config.wyoming_whisper_url}", language="en"
+                )
+                
+                # Test Wyoming server with a simple transcription to check connection
+                # If it fails, it will be caught in the exception handler below
+                test_result = wyoming_asr.transcribe(np.zeros(1600, dtype=np.float32))
+                
+                # If we got here, the Wyoming server is working
+                asr_model = wyoming_asr
+                logger.success(f"Using Wyoming Whisper at {config.wyoming_whisper_url}")
+                
+            except Exception as e:
+                # If Wyoming server fails, fall back to local ASR
+                logger.error(f"Failed to connect to Wyoming Whisper at {config.wyoming_whisper_url}: {e}")
+                logger.warning("Falling back to local ASR model")
+                asr_model = AudioTranscriber()
+        else:
+            # Use local ASR model
+            asr_model = AudioTranscriber()
+            logger.success("Using local ASR model")
 
         tts_model: tts_glados.Synthesizer | tts_kokoro.Synthesizer
         if config.voice == "glados":
             tts_model = tts_glados.Synthesizer()
         else:
-            assert config.voice in tts_kokoro.get_voices(), f"Voice '{config.wake_word}' not available"
+            assert config.voice in tts_kokoro.get_voices(), f"Voice '{config.voice}' not available"
             tts_model = tts_kokoro.Synthesizer(voice=config.voice)
 
         glados = cls(
