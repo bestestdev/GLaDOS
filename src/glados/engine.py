@@ -26,7 +26,7 @@ from .utils import spoken_text_converter as stc
 from .utils.resources import resource_path
 
 logger.remove(0)
-logger.add(sys.stderr, level="DEBUG")
+logger.add(sys.stderr, level="SUCCESS")
 
 
 class PersonalityPrompt(BaseModel):
