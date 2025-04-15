@@ -600,6 +600,28 @@ class Glados:
                 self.currently_speaking.set()
 
         self.reset()
+        
+        # Restart the input stream to continue listening for new audio
+        # This is crucial to prevent audio feedback issues
+        try:
+            # Start the input stream only if it's not already active
+            if not self.input_stream.active:
+                self.input_stream.start()
+                logger.debug("Input stream restarted after processing")
+        except Exception as e:
+            logger.error(f"Error restarting input stream: {e}")
+            # In case of error, try to recreate the input stream
+            try:
+                self.input_stream = sd.InputStream(
+                    samplerate=self.SAMPLE_RATE,
+                    channels=1,
+                    callback=self.input_stream.callback,
+                    blocksize=int(self.SAMPLE_RATE * self.VAD_SIZE / 1000),
+                )
+                self.input_stream.start()
+                logger.debug("Successfully recreated and started input stream")
+            except Exception as e2:
+                logger.error(f"Failed to recreate input stream: {e2}")
 
     def asr(self, samples: list[NDArray[np.float32]]) -> str:
         """
@@ -622,76 +644,6 @@ class Glados:
 
         detected_text = self._asr_model.transcribe(audio)
         return detected_text
-
-    def percentage_played(self, total_samples: int) -> tuple[bool, int]:
-        """
-        Monitor audio playback progress and return completion status with interrupt detection.
-
-        Streams audio samples through PortAudio and actively tracks the number of samples
-        that have been played. The playback can be interrupted by setting self.processing
-        to False or self.shutdown_event. Uses a non-blocking callback system with a completion event for
-        synchronization.
-
-        Args:
-            total_samples: Number of audio samples to be played in total. For example,
-                for 1 second of 48kHz audio, this would be 48000.
-
-        Returns:
-            A tuple containing:
-            - bool: True if playback was interrupted, False if completed normally
-            - int: Percentage of samples played (0-100), calculated as
-            (played_samples / total_samples * 100)
-
-        Raises:
-            sd.PortAudioError: If the audio stream encounters initialization or
-                playback errors
-            RuntimeError: If stream management fails during execution
-
-        Examples:
-            For 1 second of audio at 48kHz:
-            >>> interrupted, progress = audio.percentage_played(48000)
-            >>> print(f"Interrupted: {interrupted}, Progress: {progress}%")
-            Interrupted: False, Progress: 100%
-
-        Implementation Details:
-            - Uses a stream callback system to track sample count in real-time
-            - Handles interruption via self.processing flag
-            - Implements timeout based on audio duration plus 1 second buffer
-            - Caps progress percentage at 100 even if more samples are processed
-        """
-        interrupted = False
-        progress = 0
-        completion_event = threading.Event()
-
-        def stream_callback(
-            outdata: NDArray[np.float32], frames: int, time: dict[str, Any], status: sd.CallbackFlags
-        ) -> tuple[NDArray[np.float32], sd.CallbackStop | None]:
-            nonlocal progress, interrupted
-            progress += frames
-            if self.processing is False or self.shutdown_event.is_set():
-                interrupted = True
-                completion_event.set()
-                return outdata, sd.CallbackStop
-            if progress >= total_samples:
-                completion_event.set()
-            return outdata, None
-
-        try:
-            stream = sd.OutputStream(
-                callback=stream_callback,
-                samplerate=self._tts.sample_rate,
-                channels=1,
-                finished_callback=completion_event.set,
-            )
-            with stream:
-                # Wait with timeout to allow for interruption
-                completion_event.wait(timeout=total_samples / self._tts.sample_rate + 1)
-
-        except (sd.PortAudioError, RuntimeError):
-            logger.debug("Audio stream already closed or invalid")
-
-        percentage_played = min(int(progress / total_samples * 100), 100)
-        return interrupted, percentage_played
 
     def process_llm(self) -> None:
         """
@@ -997,12 +949,58 @@ class Glados:
                     continue
 
                 if len(audio_msg.audio):
-                    sd.play(audio_msg.audio, self._tts.sample_rate)
-                    total_samples = len(audio_msg.audio)
-
+                    # Instead of using sd.play, create a new OutputStream for each audio chunk
+                    # This ensures clean audio state for each playback
                     logger.success(f"TTS text: {audio_msg.text}")
-
-                    interrupted, percentage_played = self.percentage_played(total_samples)
+                    
+                    total_samples = len(audio_msg.audio)
+                    interrupted = False
+                    percentage_played = 0
+                    progress = 0
+                    completion_event = threading.Event()
+                    
+                    def stream_callback(
+                        outdata: NDArray[np.float32], frames: int, time_info: dict[str, Any], status: sd.CallbackFlags
+                    ) -> tuple[None, sd.CallbackStop | None]:
+                        nonlocal progress, interrupted
+                        
+                        if frames > 0:
+                            chunk = audio_msg.audio[progress:progress+frames]
+                            if len(chunk) < frames:
+                                outdata[:len(chunk)] = chunk.reshape(-1, 1)
+                                outdata[len(chunk):] = 0
+                            else:
+                                outdata[:] = chunk.reshape(-1, 1)
+                            
+                            progress += frames
+                            
+                        if self.processing is False or self.shutdown_event.is_set():
+                            interrupted = True
+                            completion_event.set()
+                            return None, sd.CallbackStop
+                            
+                        if progress >= total_samples:
+                            completion_event.set()
+                            
+                        return None, None
+                    
+                    try:
+                        # Create a fresh output stream for each audio playback
+                        with sd.OutputStream(
+                            samplerate=self._tts.sample_rate,
+                            channels=1,
+                            callback=stream_callback,
+                            finished_callback=completion_event.set,
+                            blocksize=1024  # Use a standard block size
+                        ) as output_stream:
+                            # Wait for playback to complete
+                            completion_event.wait(timeout=total_samples / self._tts.sample_rate + 1)
+                            
+                    except (sd.PortAudioError, RuntimeError) as e:
+                        logger.error(f"Audio playback error: {e}")
+                        interrupted = True
+                    
+                    percentage_played = min(int(progress / total_samples * 100), 100)
 
                     if interrupted:
                         clipped_text = self.clip_interrupted_sentence(audio_msg.text, percentage_played)
