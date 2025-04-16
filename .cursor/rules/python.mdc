@@ -1,0 +1,11 @@
+---
+description: 
+globs: 
+alwaysApply: true
+---
+
+# Python project-specific rules
+
+- When running specific modules directly, always use the virtual environment: `source .venv/bin/activate`
+- When adding and removing dependencies, do so in pyproject.toml
+- When needing to install new dependencies, run scripts/install.py

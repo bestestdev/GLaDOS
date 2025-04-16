@@ -62,6 +62,32 @@ def setup_config_files() -> None:
             print(f"Config file already exists: {target_file}")
 
 
+def download_vision_models() -> None:
+    """
+    Download models needed for the Vision module.
+    
+    This runs the Vision model downloader script as a module import rather than a direct script
+    execution to avoid relative import errors.
+    """
+    try:
+        print("Downloading Vision models...")
+        
+        # Use a module-based approach to run the download script
+        # This avoids the relative import error when running the script directly
+        venv_python = ".venv/bin/python" if not platform.system() == "Windows" else ".venv\\Scripts\\python.exe"
+        result = subprocess.run(
+            [venv_python, "-m", "glados.Vision.download_models"], 
+            check=False
+        )
+        
+        if result.returncode == 0:
+            print("Vision models downloaded successfully")
+        else:
+            print(f"Failed to download Vision models: process exited with code {result.returncode}")
+    except Exception as e:
+        print(f"Error downloading Vision models: {e}")
+
+
 def main() -> None:
     """
     Set up the project development environment by installing UV, creating a virtual environment,
@@ -75,6 +101,7 @@ def main() -> None:
     5. Installs the project in editable mode with appropriate dependencies
     6. Downloads and verifies project model files
     7. Set up configuration files
+    8. Downloads Vision module models if vision dependencies are installed
 
     The function handles different platform-specific configurations and supports both CUDA and CPU-only installations.
 
@@ -85,6 +112,7 @@ def main() -> None:
     """
     parser = argparse.ArgumentParser(description="Set up the project development environment.")
     parser.add_argument("--api", action="store_true", help="Install API dependencies.")
+    parser.add_argument("--vision", action="store_true", help="Install Vision dependencies.")
     args = parser.parse_args()
 
     project_root = Path(__file__).parent.parent
@@ -111,6 +139,8 @@ def main() -> None:
     extras = ["cuda"] if has_cuda else ["cpu"]
     if args.api:
         extras.append("api")
+    if args.vision:
+        extras.append("vision")
 
     # Install project in editable mode
     env = os.environ.copy()
@@ -123,6 +153,10 @@ def main() -> None:
     
     # Set up config files
     setup_config_files()
+    
+    # Download Vision models if vision extra was installed
+    if args.vision:
+        download_vision_models()
 
 
 if __name__ == "__main__":

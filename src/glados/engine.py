@@ -7,7 +7,7 @@ import re
 import sys
 import threading
 import time
-from typing import Any
+from typing import Any, Optional
 
 from Levenshtein import distance
 from loguru import logger
@@ -21,6 +21,7 @@ import yaml
 
 from .ASR import VAD, AudioTranscriber
 from .TTS import tts_glados, tts_kokoro
+from .Vision import GladosVisionIntegration, VisionProcessor
 from .utils import spoken_text_converter as stc
 from .utils.resources import resource_path
 
@@ -57,6 +58,11 @@ class GladosConfig(BaseModel):
     announcement: str | None = None
     personality_preprompt: list[PersonalityPrompt]
     conversation_timeout: float = 10.0
+    enable_vision: bool = False
+    vision_scene_announcement_interval: float = 60.0
+    person_greeting_enabled: bool = True
+    special_objects_responses: bool = True
+    wyoming_whisper_url: str | None = None
 
     @classmethod
     def from_yaml(cls, path: str | Path, key_to_config: tuple[str, ...] = ("Glados",)) -> "GladosConfig":
@@ -135,6 +141,10 @@ class Glados:
         wake_word: str | None = None,
         personality_preprompt: tuple[dict[str, str], ...] = DEFAULT_PERSONALITY_PREPROMPT,
         announcement: str | None = None,
+        enable_vision: bool = False,
+        vision_scene_announcement_interval: float = 60.0,
+        person_greeting_enabled: bool = True,
+        special_objects_responses: bool = True,
     ) -> None:
         """
         Initialize the Glados voice assistant with configuration parameters.
@@ -194,6 +204,26 @@ class Glados:
         self.currently_speaking = threading.Event()
         self.shutdown_event = threading.Event()
         self.last_response_time = 0.0  # Timestamp when the assistant last stopped speaking
+
+        # Initialize vision system if enabled
+        self.vision_integration: Optional[GladosVisionIntegration] = None
+        self.enable_vision = enable_vision
+        if enable_vision:
+            vision_processor = VisionProcessor()
+            self.vision_integration = GladosVisionIntegration(
+                self, 
+                vision=vision_processor,
+                auto_describe_scene=vision_scene_announcement_interval > 0.0,
+                scene_description_interval=vision_scene_announcement_interval,
+                person_greeting_enabled=person_greeting_enabled,
+                special_objects_responses=special_objects_responses,
+            )
+            if self.vision_integration.start():
+                logger.success("Vision system initialized and started")
+            else:
+                logger.error("Failed to start vision system")
+                self.vision_integration = None
+                self.enable_vision = False
 
         llm_thread = threading.Thread(target=self.process_llm)
         llm_thread.start()
@@ -271,14 +301,44 @@ class Glados:
         Returns:
             Glados: A new Glados instance configured with the provided settings
         """
-        asr_model = AudioTranscriber()
         vad_model = VAD()
+
+        # Initialize ASR model based on config
+        if config.wyoming_whisper_url:
+            try:
+                # Use Wyoming Whisper server if configured
+                from .Whisper import WyomingTranscriber
+                
+                logger.info(f"Attempting to use Wyoming Whisper at {config.wyoming_whisper_url}")
+                
+                # Create the Wyoming transcriber
+                wyoming_asr = WyomingTranscriber(
+                    uri=f"tcp://{config.wyoming_whisper_url}", language="en"
+                )
+                
+                # Test Wyoming server with a simple transcription to check connection
+                # If it fails, it will be caught in the exception handler below
+                test_result = wyoming_asr.transcribe(np.zeros(1600, dtype=np.float32))
+                
+                # If we got here, the Wyoming server is working
+                asr_model = wyoming_asr
+                logger.success(f"Using Wyoming Whisper at {config.wyoming_whisper_url}")
+                
+            except Exception as e:
+                # If Wyoming server fails, fall back to local ASR
+                logger.error(f"Failed to connect to Wyoming Whisper at {config.wyoming_whisper_url}: {e}")
+                logger.warning("Falling back to local ASR model")
+                asr_model = AudioTranscriber()
+        else:
+            # Use local ASR model
+            asr_model = AudioTranscriber()
+            logger.success("Using local ASR model")
 
         tts_model: tts_glados.Synthesizer | tts_kokoro.Synthesizer
         if config.voice == "glados":
             tts_model = tts_glados.Synthesizer()
         else:
-            assert config.voice in tts_kokoro.get_voices(), f"Voice '{config.wake_word}' not available"
+            assert config.voice in tts_kokoro.get_voices(), f"Voice '{config.voice}' not available"
             tts_model = tts_kokoro.Synthesizer(voice=config.voice)
 
         glados = cls(
@@ -292,6 +352,10 @@ class Glados:
             wake_word=config.wake_word,
             announcement=config.announcement,
             personality_preprompt=tuple(config.to_chat_messages()),
+            enable_vision=config.enable_vision,
+            vision_scene_announcement_interval=config.vision_scene_announcement_interval,
+            person_greeting_enabled=config.person_greeting_enabled,
+            special_objects_responses=config.special_objects_responses,
         )
         
         # Set the conversation timeout from config
@@ -340,9 +404,15 @@ class Glados:
         # Loop forever, but is 'paused' when new samples are not available
         try:
             while True:
+                # Update vision system if enabled
+                if self.enable_vision and self.vision_integration:
+                    self.vision_integration.update()
+                
                 sample, vad_confidence = self._sample_queue.get()
                 self._handle_audio_sample(sample, vad_confidence)
         except KeyboardInterrupt:
+            if self.enable_vision and self.vision_integration:
+                self.vision_integration.stop()
             self.shutdown_event.set()
             self.input_stream.stop()
 
@@ -530,6 +600,28 @@ class Glados:
                 self.currently_speaking.set()
 
         self.reset()
+        
+        # Restart the input stream to continue listening for new audio
+        # This is crucial to prevent audio feedback issues
+        try:
+            # Start the input stream only if it's not already active
+            if not self.input_stream.active:
+                self.input_stream.start()
+                logger.debug("Input stream restarted after processing")
+        except Exception as e:
+            logger.error(f"Error restarting input stream: {e}")
+            # In case of error, try to recreate the input stream
+            try:
+                self.input_stream = sd.InputStream(
+                    samplerate=self.SAMPLE_RATE,
+                    channels=1,
+                    callback=self.input_stream.callback,
+                    blocksize=int(self.SAMPLE_RATE * self.VAD_SIZE / 1000),
+                )
+                self.input_stream.start()
+                logger.debug("Successfully recreated and started input stream")
+            except Exception as e2:
+                logger.error(f"Failed to recreate input stream: {e2}")
 
     def asr(self, samples: list[NDArray[np.float32]]) -> str:
         """
@@ -552,76 +644,6 @@ class Glados:
 
         detected_text = self._asr_model.transcribe(audio)
         return detected_text
-
-    def percentage_played(self, total_samples: int) -> tuple[bool, int]:
-        """
-        Monitor audio playback progress and return completion status with interrupt detection.
-
-        Streams audio samples through PortAudio and actively tracks the number of samples
-        that have been played. The playback can be interrupted by setting self.processing
-        to False or self.shutdown_event. Uses a non-blocking callback system with a completion event for
-        synchronization.
-
-        Args:
-            total_samples: Number of audio samples to be played in total. For example,
-                for 1 second of 48kHz audio, this would be 48000.
-
-        Returns:
-            A tuple containing:
-            - bool: True if playback was interrupted, False if completed normally
-            - int: Percentage of samples played (0-100), calculated as
-            (played_samples / total_samples * 100)
-
-        Raises:
-            sd.PortAudioError: If the audio stream encounters initialization or
-                playback errors
-            RuntimeError: If stream management fails during execution
-
-        Examples:
-            For 1 second of audio at 48kHz:
-            >>> interrupted, progress = audio.percentage_played(48000)
-            >>> print(f"Interrupted: {interrupted}, Progress: {progress}%")
-            Interrupted: False, Progress: 100%
-
-        Implementation Details:
-            - Uses a stream callback system to track sample count in real-time
-            - Handles interruption via self.processing flag
-            - Implements timeout based on audio duration plus 1 second buffer
-            - Caps progress percentage at 100 even if more samples are processed
-        """
-        interrupted = False
-        progress = 0
-        completion_event = threading.Event()
-
-        def stream_callback(
-            outdata: NDArray[np.float32], frames: int, time: dict[str, Any], status: sd.CallbackFlags
-        ) -> tuple[NDArray[np.float32], sd.CallbackStop | None]:
-            nonlocal progress, interrupted
-            progress += frames
-            if self.processing is False or self.shutdown_event.is_set():
-                interrupted = True
-                completion_event.set()
-                return outdata, sd.CallbackStop
-            if progress >= total_samples:
-                completion_event.set()
-            return outdata, None
-
-        try:
-            stream = sd.OutputStream(
-                callback=stream_callback,
-                samplerate=self._tts.sample_rate,
-                channels=1,
-                finished_callback=completion_event.set,
-            )
-            with stream:
-                # Wait with timeout to allow for interruption
-                completion_event.wait(timeout=total_samples / self._tts.sample_rate + 1)
-
-        except (sd.PortAudioError, RuntimeError):
-            logger.debug("Audio stream already closed or invalid")
-
-        percentage_played = min(int(progress / total_samples * 100), 100)
-        return interrupted, percentage_played
 
     def process_llm(self) -> None:
         """
@@ -657,12 +679,64 @@ class Glados:
                 detected_text = self.llm_queue.get(timeout=0.1)
                 self.messages.append({"role": "user", "content": detected_text})
 
+                # Check if this is a vision-related query
+                is_vision_query = False
+                vision_query_patterns = [
+                    r"what (?:can|do) you see",
+                    r"(?:can|do) you see",
+                    r"what (?:are|is) (?:in front of|around) you",
+                    r"what's (?:in front of|around) you",
+                    r"describe what you see",
+                    r"tell me what you see",
+                    r"what's (?:in|on) the (?:room|scene)",
+                ]
+                
+                for pattern in vision_query_patterns:
+                    if re.search(pattern, detected_text.lower()):
+                        is_vision_query = True
+                        logger.debug(f"Detected vision-related query: '{detected_text}'")
+                        break
+
+                # Add vision context if available
+                logger.debug(f"Vision enabled: {self.enable_vision}, Vision integration available: {self.vision_integration is not None}")
+                if self.enable_vision and self.vision_integration:
+                    logger.debug(f"Generating visual context for prompt with text: '{detected_text}'")
+                    vision_context = self.vision_integration.generate_visual_context()
+                    logger.debug(f"Generated vision context: '{vision_context}'")
+                    if vision_context:
+                        # Add visual context as a system message
+                        self.messages.append({"role": "system", "content": f"Visual context: {vision_context}"})
+                        logger.success(f"Added visual context to LLM prompt: {vision_context}")
+                        
+                        # For vision-specific queries, add an extra instruction to ensure 
+                        # the response directly addresses what GLaDOS can see
+                        if is_vision_query:
+                            self.messages.append({
+                                "role": "system", 
+                                "content": "When answering this question about what you can see, make sure to directly and accurately describe the visual context provided. Do not make up objects that aren't mentioned in the visual context."
+                            })
+                    else:
+                        if is_vision_query:
+                            # For vision queries with no objects detected, provide a specific message
+                            self.messages.append({
+                                "role": "system", 
+                                "content": "You should respond that you don't see anything notable right now."
+                            })
+                            logger.warning("No vision context available for vision query, adding fallback instruction")
+                        else:
+                            logger.warning("Vision context generation returned empty result")
+                else:
+                    logger.warning("Vision context not added - either vision is disabled or integration unavailable")
+
                 data = {
                     "model": self.model,
                     "stream": True,
                     "messages": self.messages,
                 }
-                logger.debug(f"starting request on {self.messages=}")
+                # Log the full message history being sent to see if vision context is included
+                logger.debug(f"Message history being sent to LLM:")
+                for i, msg in enumerate(self.messages):
+                    logger.debug(f"  Message {i}: role={msg['role']}, content={msg['content'][:50]}...")
                 logger.debug("Performing request to LLM server...")
 
                 # Perform the request and process the stream
@@ -875,12 +949,58 @@ class Glados:
                     continue
 
                 if len(audio_msg.audio):
-                    sd.play(audio_msg.audio, self._tts.sample_rate)
-                    total_samples = len(audio_msg.audio)
-
+                    # Instead of using sd.play, create a new OutputStream for each audio chunk
+                    # This ensures clean audio state for each playback
                     logger.success(f"TTS text: {audio_msg.text}")
-
-                    interrupted, percentage_played = self.percentage_played(total_samples)
+                    
+                    total_samples = len(audio_msg.audio)
+                    interrupted = False
+                    percentage_played = 0
+                    progress = 0
+                    completion_event = threading.Event()
+                    
+                    def stream_callback(
+                        outdata: NDArray[np.float32], frames: int, time_info: dict[str, Any], status: sd.CallbackFlags
+                    ) -> tuple[None, sd.CallbackStop | None]:
+                        nonlocal progress, interrupted
+                        
+                        if frames > 0:
+                            chunk = audio_msg.audio[progress:progress+frames]
+                            if len(chunk) < frames:
+                                outdata[:len(chunk)] = chunk.reshape(-1, 1)
+                                outdata[len(chunk):] = 0
+                            else:
+                                outdata[:] = chunk.reshape(-1, 1)
+                            
+                            progress += frames
+                            
+                        if self.processing is False or self.shutdown_event.is_set():
+                            interrupted = True
+                            completion_event.set()
+                            return None, sd.CallbackStop
+                            
+                        if progress >= total_samples:
+                            completion_event.set()
+                            
+                        return None, None
+                    
+                    try:
+                        # Create a fresh output stream for each audio playback
+                        with sd.OutputStream(
+                            samplerate=self._tts.sample_rate,
+                            channels=1,
+                            callback=stream_callback,
+                            finished_callback=completion_event.set,
+                            blocksize=1024  # Use a standard block size
+                        ) as output_stream:
+                            # Wait for playback to complete
+                            completion_event.wait(timeout=total_samples / self._tts.sample_rate + 1)
+                            
+                    except (sd.PortAudioError, RuntimeError) as e:
+                        logger.error(f"Audio playback error: {e}")
+                        interrupted = True
+                    
+                    percentage_played = min(int(progress / total_samples * 100), 100)
 
                     if interrupted:
                         clipped_text = self.clip_interrupted_sentence(audio_msg.text, percentage_played)
